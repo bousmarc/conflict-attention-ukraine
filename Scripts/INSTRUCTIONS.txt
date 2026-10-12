@@ -1,0 +1,32 @@
+HOW TO RUN: Conflict Intensity and Global Search Attention
+
+Note:
+This project uses the `here` package in R for automatic path detection. All files must remain in their original folder structure exactly as provided in the zip. Moving or renaming any file or folder will break the file paths and prevent the script from running.
+
+
+REQUIRED FOLDER STRUCTURE:
+
+Project Submission/
+├── Scripts/
+│   └── Conflict-Google project (Boustany & Gunduz).Rmd
+├── Data/
+│   ├── ACLED/
+│   │   └── Europe-Central-Asia_...csv
+│   ├── Google Trends/
+│   │   ├── Worldwide/
+│   │   │   └── 2023.csv, 2024.csv, 2025.csv, 2026.csv
+│   │   ├── Pro Ukraine/
+│   │   │   └── Estonia_2023.csv, Poland_2023.csv, ... (all years)
+│   │   └── Pro Russia/
+│   │       └── India_2023.csv, Serbia_2023.csv, ... (all years)
+
+
+AUTOMATIC DOWNLOADS:
+VIX and S&P 500 data are downloaded automatically from FRED and
+Yahoo Finance when the script runs. An internet connection is required.
+
+
+REQUIRED R PACKAGES:
+The script installs missing packages automatically on first run:
+here, ggplot2, patchwork, tseries, lmtest, sandwich,
+stargazer, vars, quantmod

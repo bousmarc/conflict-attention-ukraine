@@ -1,0 +1,1008 @@
+---
+title: "Conflict Intensity and Global Search Attention"
+author: "Marc Boustany & Ahmet Gündüz (HEC Lausanne)"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+subtitle: Russia-Ukraine War - Macroeconometric Project | HEC Lausanne
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+---
+
+> **Research question:** Do weekly changes in Russia-Ukraine conflict intensity (ACLED
+> violent events) help explain weekly changes in worldwide Google search interest for the
+> term *"ukraine war"*? Sample: 2023-2026, n approx 170 weekly observations. 2022 is excluded
+> due to a visible normalisation discontinuity in the stitched Google Trends series.
+
+---
+
+> **How to run:** Clone the repository, open this `.Rmd` file in RStudio (it lives in
+> `Scripts/`) and hit **Knit**. No path editing is needed. Raw ACLED data are not
+> redistributed (ACLED terms of use); see `Data/ACLED/README.md` to download them.
+> VIX and S&P 500 are downloaded automatically from FRED and Yahoo Finance.
+
+---
+
+# Data Construction
+
+## Required packages
+
+```{r packages}
+required_packages <- c("here", "ggplot2", "patchwork", "tseries",
+                       "lmtest", "sandwich", "stargazer", "vars", "quantmod")
+
+missing_pkgs <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+
+# AEC (course package: sim.arma, estim.armax, make.PHI) is installed from GitHub
+if (!requireNamespace("AEC", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+  remotes::install_github("jrenne/AEC")
+}
+
+library(here)
+library(ggplot2)
+library(patchwork)
+library(tseries)
+library(lmtest)
+library(sandwich)
+library(stargazer)
+library(vars)
+library(quantmod)
+library(AEC)
+
+here::i_am("Scripts/conflict_attention.Rmd")
+
+# SHARED PLOT THEME
+# Edit this block to restyle all figures at once.
+theme_project <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 14, hjust = 0,
+                                       margin = margin(b = 4)),
+      plot.subtitle     = element_text(size = 11, color = "grey35", hjust = 0,
+                                       margin = margin(b = 8)),
+      axis.title        = element_text(size = 11, color = "grey20", face = "bold"),
+      axis.text         = element_text(size = 10, color = "grey30"),
+      axis.line         = element_line(color = "grey70", linewidth = 0.4),
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(color = "grey90", linewidth = 0.4),
+      legend.position   = "bottom",
+      legend.title      = element_blank(),
+      legend.text       = element_text(size = 11),
+      legend.key.width  = unit(1.8, "cm"),
+      strip.text        = element_text(face = "bold", size = 11),
+      plot.margin       = margin(12, 18, 12, 18),
+      plot.background   = element_rect(fill = "white", color = NA),
+      panel.background  = element_rect(fill = "white", color = NA)
+    )
+}
+
+# BOOTSTRAP CI
+# Computes residual-bootstrap confidence bands for any ADL/lm IRF.
+
+bootstrap_irf_ci <- function(model, own_lag_names, conflict_lag_names,
+                              h = 20, n_boot = 500, ci_level = 0.90) {
+  Y      <- model$model[, 1]
+  X      <- model.matrix(model)
+  resids <- residuals(model)
+  coefs  <- coef(model)
+  n      <- length(Y)
+
+  # Helper: compute one IRF from a coefficient vector
+  compute_one_irf <- function(b) {
+    phi   <- as.numeric(b[own_lag_names]);       phi[is.na(phi)]   <- 0
+    theta <- as.numeric(b[conflict_lag_names]);  theta[is.na(theta)] <- 0
+    irf   <- numeric(h)
+    for (t in 1:h) {
+      direct     <- if (t <= length(theta)) theta[t] else 0
+      propagated <- if (t > 1)
+        sum(phi[1:min(t-1,length(phi))] * irf[(t-1):max(1,t-length(phi))]) else 0
+      irf[t] <- direct + propagated
+    }
+    irf
+  }
+
+  # Point estimate
+  irf_point <- compute_one_irf(coefs)
+
+  # Bootstrap loop: resample residuals, reconstruct Y, refit, recompute IRF
+  boot_mat <- matrix(NA, nrow = n_boot, ncol = h)
+  for (b in seq_len(n_boot)) {
+    Y_boot        <- X %*% coefs + sample(resids, n, replace = TRUE)
+    df_boot       <- as.data.frame(cbind(Y_boot, X[, -1]))
+    names(df_boot)[1] <- names(model$model)[1]
+    fit_boot      <- tryCatch(lm(reformulate(names(df_boot)[-1], names(df_boot)[1]),
+                                 data = df_boot),
+                              error = function(e) NULL)
+    if (!is.null(fit_boot))
+      boot_mat[b, ] <- compute_one_irf(coef(fit_boot))
+  }
+
+  alpha <- (1 - ci_level) / 2
+  list(
+    point = irf_point,
+    lower = apply(boot_mat, 2, quantile, probs = alpha,     na.rm = TRUE),
+    upper = apply(boot_mat, 2, quantile, probs = 1 - alpha, na.rm = TRUE)
+  )
+}
+```
+
+## ACLED conflict data
+
+```{r load-acled}
+acled_file <- list.files(here("Data/ACLED"), pattern = "^Europe-Central-Asia.*\\.csv$",
+                         full.names = TRUE)[1]
+if (is.na(acled_file)) stop("ACLED file not found: see Data/ACLED/README.md")
+acled_data <- read.csv(acled_file)
+```
+
+```{r build-conflict}
+ukraine_acled <- subset(acled_data, COUNTRY == "Ukraine")
+ukraine_acled_narrow <- subset(ukraine_acled,
+  EVENT_TYPE %in% c("Battles","Explosions/Remote violence","Violence against civilians"))
+weekly_ukraine <- aggregate(EVENTS ~ WEEK, data = ukraine_acled_narrow, sum)
+weekly_ukraine$week_date <- as.Date(weekly_ukraine$WEEK, format = "%d-%B-%Y")
+weekly_ukraine <- weekly_ukraine[order(weekly_ukraine$week_date), ]
+weekly_ukraine <- subset(weekly_ukraine, week_date >= as.Date("2022-01-01"))
+
+russia_acled <- subset(acled_data, COUNTRY == "Russia")
+russia_acled_narrow <- subset(russia_acled,
+  EVENT_TYPE %in% c("Battles","Explosions/Remote violence","Violence against civilians"))
+weekly_russia <- aggregate(EVENTS ~ WEEK, data = russia_acled_narrow, sum)
+weekly_russia$week_date <- as.Date(weekly_russia$WEEK, format = "%d-%B-%Y")
+weekly_russia <- weekly_russia[order(weekly_russia$week_date), ]
+weekly_russia <- subset(weekly_russia, week_date >= as.Date("2022-01-01"))
+
+ukraine_w <- weekly_ukraine[, c("week_date","EVENTS")]; names(ukraine_w)[2] <- "ukraine_events"
+russia_w  <- weekly_russia[,  c("week_date","EVENTS")]; names(russia_w)[2]  <- "russia_events"
+
+combined_weekly <- merge(ukraine_w, russia_w, by = "week_date", all = TRUE)
+combined_weekly$ukraine_events[is.na(combined_weekly$ukraine_events)] <- 0
+combined_weekly$russia_events[is.na(combined_weekly$russia_events)]   <- 0
+combined_weekly$combined_events <- combined_weekly$ukraine_events + combined_weekly$russia_events
+combined_weekly <- combined_weekly[order(combined_weekly$week_date), ]
+acled_2023 <- subset(combined_weekly, week_date >= as.Date("2023-01-01"))
+```
+
+## Google Trends data (worldwide)
+
+```{r load-google}
+gt_2023 <- read.csv(here("Data/Google Trends/Worldwide/2023.csv"))
+gt_2024 <- read.csv(here("Data/Google Trends/Worldwide/2024.csv"))
+gt_2025 <- read.csv(here("Data/Google Trends/Worldwide/2025.csv"))
+gt_2026 <- read.csv(here("Data/Google Trends/Worldwide/2026.csv"))
+
+for (df_name in c("gt_2023","gt_2024","gt_2025","gt_2026")) {
+  tmp <- get(df_name)
+  tmp$Time        <- as.Date(tmp$Time)
+  tmp$ukraine.war <- as.numeric(tmp$ukraine.war)
+  assign(df_name, tmp)
+}
+google_weekly <- rbind(gt_2023, gt_2024, gt_2025, gt_2026)
+google_weekly <- google_weekly[order(google_weekly$Time), ]
+```
+
+## Merge ACLED and Google Trends
+
+```{r merge}
+google_weekly$Time_aligned <- google_weekly$Time + 6
+project_data_2023on <- merge(acled_2023, google_weekly,
+                             by.x = "week_date", by.y = "Time_aligned", all = FALSE)
+project_data_2023on <- project_data_2023on[order(project_data_2023on$week_date), ]
+cat("Merged dataset:", nrow(project_data_2023on), "weekly observations\n")
+cat("Date range:    ", format(min(project_data_2023on$week_date)), "to",
+    format(max(project_data_2023on$week_date)), "\n")
+```
+
+## Raw data plots
+
+```{r plot-raw, fig.height=7}
+p1 <- ggplot(project_data_2023on, aes(x = week_date, y = combined_events)) +
+  geom_line(color = "#1A5276", linewidth = 1.1) +
+  geom_hline(yintercept = mean(project_data_2023on$combined_events),
+             linetype = "dashed", color = "#C0392B", linewidth = 0.8) +
+  labs(title = "ACLED: Weekly Conflict Intensity",
+       subtitle = "2023 onward — combined Ukraine + Russia violent events (dashed = mean)",
+       x = NULL, y = "Violent events per week") +
+  theme_project()
+
+p2 <- ggplot(project_data_2023on, aes(x = week_date, y = ukraine.war)) +
+  geom_line(color = "#C0392B", linewidth = 1.1) +
+  geom_hline(yintercept = mean(project_data_2023on$ukraine.war, na.rm = TRUE),
+             linetype = "dashed", color = "#1A5276", linewidth = 0.8) +
+  labs(title = "Google Trends: 'ukraine war' Worldwide",
+       subtitle = "2023 onward — weekly search interest index (0-100, dashed = mean)",
+       x = "Week", y = "Google Trends index") +
+  theme_project()
+
+p1 / p2
+```
+
+> **Visual takeaway:** Conflict intensity is persistent and upward-trending — first
+> signal of non-stationarity. Google Trends is spiky and burst-driven.
+
+---
+
+# Stationarity Analysis
+
+## Formal tests in levels
+
+```{r stationarity-levels}
+adf_conflict  <- adf.test(project_data_2023on$combined_events, k = 5)
+adf_google    <- adf.test(na.omit(project_data_2023on$ukraine.war), k = 5)
+kpss_conflict <- kpss.test(project_data_2023on$combined_events, null = "Level")
+kpss_google   <- kpss.test(na.omit(project_data_2023on$ukraine.war), null = "Level")
+
+cat("=== ADF (levels) ===\n")
+cat("Conflict: p =", round(adf_conflict$p.value, 3), "\n")
+cat("Google:   p =", round(adf_google$p.value,   3), "\n\n")
+cat("=== KPSS (levels) ===\n")
+cat("Conflict: p =", round(kpss_conflict$p.value, 3), "\n")
+cat("Google:   p =", round(kpss_google$p.value,   3), "\n")
+```
+
+> Conflict is clearly non-stationary. **Decision: first-difference both series.**
+
+## First differences and standardisation
+
+```{r first-differences}
+# Step 1: first differences
+project_data_2023on$d_conflict <- c(NA, diff(project_data_2023on$combined_events))
+project_data_2023on$d_google   <- c(NA, diff(project_data_2023on$ukraine.war))
+project_data_2023on$d_ukraine  <- c(NA, diff(project_data_2023on$ukraine_events))
+project_data_2023on$d_russia   <- c(NA, diff(project_data_2023on$russia_events))
+
+# Step 2: z-score standardisation
+# Puts conflict (0-2000 events) and Google Trends (0-100 index) on the same scale.
+# Coefficients now read as SDs. p-values and significance are unchanged.
+project_data_2023on$d_conflict <- as.numeric(scale(project_data_2023on$d_conflict))
+project_data_2023on$d_google   <- as.numeric(scale(project_data_2023on$d_google))
+project_data_2023on$d_ukraine  <- as.numeric(scale(project_data_2023on$d_ukraine))
+project_data_2023on$d_russia   <- as.numeric(scale(project_data_2023on$d_russia))
+
+# Step 3: clean vectors for ACF/PACF/periodogram
+d_conflict_clean <- na.omit(project_data_2023on$d_conflict)
+d_google_clean   <- na.omit(project_data_2023on$d_google)
+
+cat("=== ADF (first differences, standardised) ===\n")
+cat("d_conflict: p =", round(adf.test(d_conflict_clean, k=5)$p.value, 3), "\n")
+cat("d_google:   p =", round(adf.test(d_google_clean,   k=5)$p.value, 3), "\n\n")
+cat("=== KPSS (first differences, standardised) ===\n")
+cat("d_conflict: p =", round(kpss.test(d_conflict_clean)$p.value, 3), "\n")
+cat("d_google:   p =", round(kpss.test(d_google_clean)$p.value,   3), "\n")
+```
+
+```{r plot-differences, fig.height=7}
+p3 <- ggplot(project_data_2023on, aes(x = week_date, y = d_conflict)) +
+  geom_line(color = "#1A5276", linewidth = 1.0) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#C0392B", linewidth = 0.8) +
+  labs(title = "First Difference — Conflict Intensity (Standardised)",
+       x = NULL, y = "SD units") +
+  theme_project()
+
+p4 <- ggplot(project_data_2023on, aes(x = week_date, y = d_google)) +
+  geom_line(color = "#C0392B", linewidth = 1.0) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#1A5276", linewidth = 0.8) +
+  labs(title = "First Difference — Google Trends (Standardised)",
+       x = "Week", y = "SD units") +
+  theme_project()
+
+p3 / p4
+```
+
+---
+
+# ACF / PACF Analysis
+
+```{r acf-d-conflict, fig.height=7}
+par(mfrow = c(3,1), mar = c(4,4.5,3,1), bg = "white")
+plot(project_data_2023on$week_date, project_data_2023on$d_conflict,
+     type = "l", col = "#1A5276", lwd = 2,
+     xlab = "Week", ylab = "SD units", cex.lab = 1.2, cex.axis = 1.1,
+     main = "First Difference of Conflict Intensity (Standardised)", cex.main = 1.2)
+abline(h = 0, lty = 2, col = "grey50", lwd = 1.2)
+acf(d_conflict_clean,  lag.max = 22, main = "ACF — d_conflict",
+    col = "#1A5276", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+pacf(d_conflict_clean, lag.max = 22, main = "PACF — d_conflict",
+     col = "#1A5276", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+par(mfrow = c(1,1))
+```
+
+```{r acf-d-google, fig.height=7}
+par(mfrow = c(3,1), mar = c(4,4.5,3,1), bg = "white")
+plot(project_data_2023on$week_date, project_data_2023on$d_google,
+     type = "l", col = "#C0392B", lwd = 2,
+     xlab = "Week", ylab = "SD units", cex.lab = 1.2, cex.axis = 1.1,
+     main = "First Difference of Google Trends (Standardised)", cex.main = 1.2)
+abline(h = 0, lty = 2, col = "grey50", lwd = 1.2)
+acf(d_google_clean,  lag.max = 22, main = "ACF — d_google",
+    col = "#C0392B", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+pacf(d_google_clean, lag.max = 22, main = "PACF — d_google",
+     col = "#C0392B", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+par(mfrow = c(1,1))
+```
+
+---
+
+# Seasonality Check
+
+```{r seasonality-boxplot, fig.height=6}
+project_data_2023on$month <- as.integer(format(project_data_2023on$week_date, "%m"))
+df_season <- na.omit(data.frame(
+  d_google   = project_data_2023on$d_google,
+  d_conflict = project_data_2023on$d_conflict,
+  month      = factor(project_data_2023on$month, labels = month.abb)
+))
+
+pb1 <- ggplot(df_season, aes(x = month, y = d_google)) +
+  geom_boxplot(fill = "#AED6F1", color = "#1A5276", linewidth = 0.7, outlier.size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#C0392B", linewidth = 0.8) +
+  labs(title = "Seasonal Pattern — d_google", x = "Month", y = "SD units") +
+  theme_project()
+
+pb2 <- ggplot(df_season, aes(x = month, y = d_conflict)) +
+  geom_boxplot(fill = "#FADBD8", color = "#C0392B", linewidth = 0.7, outlier.size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#1A5276", linewidth = 0.8) +
+  labs(title = "Seasonal Pattern — d_conflict", x = "Month", y = "SD units") +
+  theme_project()
+
+pb1 / pb2
+```
+
+```{r periodogram, fig.height=6}
+par(mfrow = c(2,1), mar = c(4,4.5,3,1), bg = "white")
+spec.pgram(d_google_clean,   log = "no", col = "#C0392B", lwd = 2,
+           main = "Periodogram — d_google (standardised)",
+           xlab = "Frequency (cycles/week)", cex.main = 1.2, cex.axis = 1.1)
+spec.pgram(d_conflict_clean, log = "no", col = "#1A5276", lwd = 2,
+           main = "Periodogram — d_conflict (standardised)",
+           xlab = "Frequency (cycles/week)", cex.main = 1.2, cex.axis = 1.1)
+par(mfrow = c(1,1))
+```
+
+```{r seasonality-ftest}
+season_data <- na.omit(data.frame(
+  d_google   = project_data_2023on$d_google,
+  d_conflict = project_data_2023on$d_conflict,
+  month      = as.factor(project_data_2023on$month)
+))
+ftest_g <- anova(lm(d_google   ~ 1, data = season_data), lm(d_google   ~ month, data = season_data))
+ftest_c <- anova(lm(d_conflict ~ 1, data = season_data), lm(d_conflict ~ month, data = season_data))
+cat("Seasonal F-test — d_google:   p =", round(ftest_g[2, "Pr(>F)"], 3), "\n")
+cat("Seasonal F-test — d_conflict: p =", round(ftest_c[2, "Pr(>F)"], 3), "\n")
+```
+
+> No seasonal pattern. **No seasonal adjustment needed.**
+
+---
+
+# ADL Model Selection
+
+```{r create-lags}
+max_lags <- 3
+CONFLICT   <- project_data_2023on$d_conflict
+names_lags <- "lag0"
+for (i in 1:max_lags) {
+  CONFLICT   <- cbind(CONFLICT,
+                      c(rep(NA,i), project_data_2023on$d_conflict[1:(nrow(project_data_2023on)-i)]))
+  names_lags <- c(names_lags, paste0("lag",i))
+}
+colnames(CONFLICT) <- names_lags
+d_google_lag1 <- c(NA, project_data_2023on$d_google[1:(nrow(project_data_2023on)-1)])
+model_data <- na.omit(data.frame(d_google = project_data_2023on$d_google,
+                                 d_google_lag1 = d_google_lag1, CONFLICT))
+cat("Observations available:", nrow(model_data), "\n")
+```
+
+```{r estimate-models}
+m1 <- lm(d_google ~ d_google_lag1,                             data = model_data)
+m2 <- lm(d_google ~ d_google_lag1 + lag0,                      data = model_data)
+m3 <- lm(d_google ~ d_google_lag1 + lag0 + lag1,               data = model_data)
+m4 <- lm(d_google ~ d_google_lag1 + lag0 + lag1 + lag2,        data = model_data)
+m5 <- lm(d_google ~ d_google_lag1 + lag0 + lag1 + lag2 + lag3, data = model_data)
+```
+
+```{r aic-bic}
+model_list      <- list(m1, m2, m3, m4, m5)
+model_names_sel <- c("m1: own lag only","m2: +lag0","m3: +lag0-1","m4: +lag0-2","m5: +lag0-3")
+ic_table <- data.frame(
+  Model = model_names_sel,
+  k     = sapply(model_list, function(m) length(coef(m))),
+  AIC   = round(sapply(model_list, AIC), 2),
+  BIC   = round(sapply(model_list, BIC), 2)
+)
+print(ic_table)
+cat("\nBest by AIC:", model_names_sel[which.min(ic_table$AIC)], "\n")
+cat("Best by BIC:", model_names_sel[which.min(ic_table$BIC)], "\n")
+```
+
+> **AIC selects m4; BIC selects m1.** We adopt m4 and augment next.
+
+---
+
+# Preferred Model: m4b
+
+```{r augmented-model}
+model_data$d_google_lag2 <- c(NA, model_data$d_google_lag1[1:(nrow(model_data)-1)])
+m4b <- lm(d_google ~ d_google_lag1 + d_google_lag2 + lag0 + lag1 + lag2, data = model_data)
+summary(m4b)
+```
+
+```{r residual-diagnostics-m4b, fig.height=7}
+res_m4b <- residuals(m4b)
+par(mfrow = c(3,1), mar = c(4,4.5,3,1), bg = "white")
+plot(res_m4b, type = "l", col = "#1A5276", lwd = 2,
+     main = "Residuals — m4b", xlab = "Week", ylab = "Residual",
+     cex.main = 1.2, cex.axis = 1.1, cex.lab = 1.2)
+abline(h = 0, lty = 2, col = "grey50", lwd = 1.2)
+acf(res_m4b,  lag.max = 22, main = "ACF of Residuals — m4b",
+    col = "#1A5276", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+pacf(res_m4b, lag.max = 22, main = "PACF of Residuals — m4b",
+     col = "#1A5276", lwd = 2, cex.main = 1.2, cex.axis = 1.1)
+par(mfrow = c(1,1))
+
+bg_m4  <- bgtest(m4,  order = 4)
+bg_m4b <- bgtest(m4b, order = 4)
+cat("Breusch-Godfrey — m4:  p =", round(bg_m4$p.value,  3), "\n")
+cat("Breusch-Godfrey — m4b: p =", round(bg_m4b$p.value, 3), "\n\n")
+cat("m4  — AIC:", round(AIC(m4),  2), "| BIC:", round(BIC(m4),  2), "\n")
+cat("m4b — AIC:", round(AIC(m4b), 2), "| BIC:", round(BIC(m4b), 2), "\n")
+```
+
+```{r hac-m4b}
+hac_se_m4b <- sqrt(diag(NeweyWest(m4b, lag = 4, prewhite = FALSE)))
+cat("=== m4b: OLS vs HAC ===\n")
+stargazer(m4b, m4b, type = "text",
+          column.labels = c("OLS","HAC"),
+          se = list(NULL, hac_se_m4b),
+          keep.stat = "n", no.space = TRUE)
+```
+
+---
+
+# Impulse Response Function (m4b) with Bootstrap Confidence Bands
+
+The shaded band is a **90% bootstrap confidence interval** (500 replications, residual
+resampling). If the band excludes zero at a given horizon, the response is statistically
+significant there.
+
+```{r irf-m4b, fig.height=5}
+set.seed(42)
+nb.periods <- 20
+
+phi_m4b  <- c(coef(m4b)["d_google_lag1"], coef(m4b)["d_google_lag2"])
+beta_m4b <- c(coef(m4b)["lag0"], coef(m4b)["lag1"], coef(m4b)["lag2"])
+
+IRF_m4b <- sim.arma(c = 0, phi = phi_m4b, theta = beta_m4b, sigma = 1,
+                    T = nb.periods, y.0 = rep(0,2), nb.sim = 1, make.IRF = 1)
+
+ci_m4b <- bootstrap_irf_ci(
+  m4b,
+  own_lag_names      = c("d_google_lag1","d_google_lag2"),
+  conflict_lag_names = c("lag0","lag1","lag2"),
+  h = nb.periods, n_boot = 500, ci_level = 0.90
+)
+
+df_irf_m4b <- data.frame(
+  week  = 0:(nb.periods-1),
+  irf   = ci_m4b$point,
+  lower = ci_m4b$lower,
+  upper = ci_m4b$upper
+)
+
+cum_effect_m4b <- sum(ci_m4b$point)
+df_irf_m4b_plot <- subset(df_irf_m4b, week <= 10)
+
+ggplot(df_irf_m4b_plot, aes(x = week)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#1A5276", alpha = 0.15) +
+  geom_line(aes(y = irf), color = "#1A5276", linewidth = 1.4) +
+  geom_point(aes(y = irf), color = "#1A5276", size = 2.5) +
+  scale_x_continuous(breaks = 0:10) +
+  labs(
+    title = NULL,
+    subtitle = NULL,
+    x = "Weeks after shock",
+    y = "SD units (search attention)"
+  ) +
+  theme_project()
+
+cat("Multipliers:\n"); print(round(ci_m4b$point, 4))
+cat("Cumulative:", round(cum_effect_m4b, 4), "\n")
+```
+
+## Robustness: OLS vs ARMA-X
+
+```{r armax, fig.height=5}
+nb.lags.exog <- 2
+CONF_X <- model_data$lag0
+for (i in 1:nb.lags.exog) CONF_X <- cbind(CONF_X, model_data[[paste0("lag",i)]])
+colnames(CONF_X) <- paste0("lag", 0:nb.lags.exog)
+good      <- complete.cases(model_data$d_google, CONF_X)
+res.armax <- estim.armax(Y = model_data$d_google[good], p = 2, q = 0, X = CONF_X[good,])
+
+IRF_armax <- sim.arma(c = 0, phi = res.armax$phi, theta = res.armax$beta, sigma = 1,
+                      T = nb.periods, y.0 = rep(0, length(res.armax$phi)),
+                      nb.sim = 1, make.IRF = 1)
+
+df_cmp <- data.frame(
+  week   = rep(0:(nb.periods-1), 2),
+  irf    = c(ci_m4b$point, IRF_armax),
+  method = rep(c("OLS (m4b)","ARMA-X(2,0,2)"), each = nb.periods)
+)
+
+ggplot(df_cmp, aes(x = week, y = irf, color = method, linetype = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_line(linewidth = 1.4) + geom_point(size = 2.5) +
+  scale_color_manual(values = c("OLS (m4b)" = "#1A5276", "ARMA-X(2,0,2)" = "#C0392B")) +
+  scale_linetype_manual(values = c("OLS (m4b)" = "solid", "ARMA-X(2,0,2)" = "dashed")) +
+  labs(title = "IRF Comparison: OLS (m4b) vs ARMA-X(2,0,2)",
+       subtitle = paste0("Cumulative OLS: ", round(sum(ci_m4b$point), 3),
+                         "  |  Cumulative ARMA-X: ", round(sum(IRF_armax), 3)),
+       x = "Weeks after shock", y = "SD units (search attention)") +
+  theme_project()
+```
+
+> Both IRFs virtually identical -- OLS results robust to estimation method.
+
+---
+
+# VAR and Granger Causality
+
+```{r var-granger}
+var_data <- na.omit(data.frame(d_google   = project_data_2023on$d_google,
+                               d_conflict = project_data_2023on$d_conflict))
+var_select    <- VARselect(var_data, lag.max = 6)
+p_bic         <- var_select$selection["SC(n)"]
+estimated_var <- VAR(var_data, p = p_bic)
+
+Phi <- Acoef(estimated_var); PHI <- make.PHI(Phi)
+cat("Eigenvalues:", round(abs(eigen(PHI)$values), 4), "\n\n")
+cat("H0: d_conflict does NOT Granger-cause d_google\n")
+print(grangertest(var_data$d_google, var_data$d_conflict, order = p_bic))
+cat("H0: d_google does NOT Granger-cause d_conflict\n")
+print(grangertest(var_data$d_conflict, var_data$d_google, order = p_bic))
+```
+
+> No reverse causality -- ADL framework validated.
+
+---
+
+# Normalisation Hypothesis: Ukraine vs Russia Territory
+
+```{r ukraine-russia-stationarity}
+d_ukr_clean <- na.omit(project_data_2023on$d_ukraine)
+d_rus_clean <- na.omit(project_data_2023on$d_russia)
+cat("d_ukraine — ADF p:", round(adf.test(d_ukr_clean,k=5)$p.value,3),
+    "| KPSS p:", round(kpss.test(d_ukr_clean)$p.value,3), "\n")
+cat("d_russia  — ADF p:", round(adf.test(d_rus_clean,k=5)$p.value,3),
+    "| KPSS p:", round(kpss.test(d_rus_clean)$p.value,3), "\n")
+```
+
+```{r split-conflict-models}
+model_data_split <- na.omit(data.frame(
+  d_google       = project_data_2023on$d_google,
+  d_google_lag1  = c(NA, project_data_2023on$d_google[1:(nrow(project_data_2023on)-1)]),
+  d_ukraine      = project_data_2023on$d_ukraine,
+  d_ukraine_lag1 = c(NA, project_data_2023on$d_ukraine[1:(nrow(project_data_2023on)-1)]),
+  d_ukraine_lag2 = c(NA, NA, project_data_2023on$d_ukraine[1:(nrow(project_data_2023on)-2)]),
+  d_russia       = project_data_2023on$d_russia,
+  d_russia_lag1  = c(NA, project_data_2023on$d_russia[1:(nrow(project_data_2023on)-1)]),
+  d_russia_lag2  = c(NA, NA, project_data_2023on$d_russia[1:(nrow(project_data_2023on)-2)])
+))
+model_data_split$d_google_lag2 <-
+  c(NA, model_data_split$d_google_lag1[1:(nrow(model_data_split)-1)])
+model_data_split <- na.omit(model_data_split)
+
+mA_split <- lm(d_google ~ d_google_lag1 + d_google_lag2 + d_ukraine + d_ukraine_lag1 + d_ukraine_lag2,
+               data = model_data_split)
+mB_split <- lm(d_google ~ d_google_lag1 + d_google_lag2 + d_russia  + d_russia_lag1  + d_russia_lag2,
+               data = model_data_split)
+cat("Model A (Ukraine) — AIC:", round(AIC(mA_split),2), "| BIC:", round(BIC(mA_split),2), "\n")
+cat("Model B (Russia)  — AIC:", round(AIC(mB_split),2), "| BIC:", round(BIC(mB_split),2), "\n")
+```
+
+```{r irf-split, fig.height=5}
+set.seed(42)
+
+ci_ukraine <- bootstrap_irf_ci(mA_split,
+    own_lag_names      = c("d_google_lag1","d_google_lag2"),
+    conflict_lag_names = c("d_ukraine","d_ukraine_lag1","d_ukraine_lag2"),
+    h = nb.periods, n_boot = 500, ci_level = 0.90)
+
+ci_russia <- bootstrap_irf_ci(mB_split,
+    own_lag_names      = c("d_google_lag1","d_google_lag2"),
+    conflict_lag_names = c("d_russia","d_russia_lag1","d_russia_lag2"),
+    h = nb.periods, n_boot = 500, ci_level = 0.90)
+
+df_irf_split <- data.frame(
+  week      = rep(0:(nb.periods-1), 2),
+  irf       = c(ci_ukraine$point, ci_russia$point),
+  lower     = c(ci_ukraine$lower, ci_russia$lower),
+  upper     = c(ci_ukraine$upper, ci_russia$upper),
+  territory = rep(c("Ukraine territory","Russia territory"), each = nb.periods)
+)
+
+df_irf_split_plot <- subset(df_irf_split, week <= 10)
+
+ggplot(df_irf_split_plot, aes(x = week, color = territory, fill = territory)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(aes(y = irf), linewidth = 1.4) +
+  geom_point(aes(y = irf), size = 2.5) +
+  scale_color_manual(values = c("Ukraine territory" = "#1A5276",
+                                "Russia territory"  = "#C0392B")) +
+  scale_fill_manual(values  = c("Ukraine territory" = "#1A5276",
+                                "Russia territory"  = "#C0392B")) +
+  scale_x_continuous(breaks = 0:10) +
+  annotate("text", x = 8, y = max(ci_russia$upper) * 0.92,
+           label = paste0("Russia cumulative: ",  round(sum(ci_russia$point),  3)),
+           color = "#C0392B", size = 4, fontface = "bold", hjust = 1) +
+  annotate("text", x = 8, y = max(ci_russia$upper) * 0.72,
+           label = paste0("Ukraine cumulative: ", round(sum(ci_ukraine$point), 3)),
+           color = "#1A5276", size = 4, fontface = "bold", hjust = 1) +
+  labs(title = "IRF: Worldwide Search Attention by Conflict Territory",
+       subtitle = "Shaded band = 90% bootstrap CI | Normalisation hypothesis",
+       x = "Weeks after shock", y = "SD units (search attention)") +
+  theme_project()
+```
+
+> **Normalisation confirmed.** Russia attacks generate far more attention. Ukraine attacks'
+> CI fully overlaps zero.
+
+---
+
+# Extension 1 — Audience Heterogeneity
+
+- **Pro-Ukraine:** Poland, Sweden, United Kingdom, Estonia
+- **Pro-Russia:** Serbia, India, Vietnam, Indonesia
+
+```{r load-countries}
+path_uk <- paste0(here("Data/Google Trends/Pro Ukraine"), "/")
+path_ru <- paste0(here("Data/Google Trends/Pro Russia"),  "/")
+
+load_country <- function(country, path) {
+  years <- c(2023, 2024, 2025, 2026)
+  df_list <- lapply(years, function(yr) {
+    df           <- read.csv(paste0(path, country, "_", yr, ".csv"))
+    colnames(df) <- c("Time","index")
+    df$index     <- as.numeric(df$index)
+    df$Time      <- tryCatch(as.Date(df$Time, format = "%Y-%m-%d"),
+                             error = function(e) as.Date(df$Time, format = "%m/%d/%Y"))
+    if (all(is.na(df$Time))) df$Time <- as.Date(df$Time, format = "%m/%d/%Y")
+    df
+  })
+  df_all <- do.call(rbind, df_list)
+  df_all <- df_all[!duplicated(df_all$Time), ]
+  df_all[df_all$Time >= as.Date("2023-01-01"), ]
+}
+
+Estonia <- load_country("Estonia",path_uk); Poland    <- load_country("Poland",   path_uk)
+Sweden  <- load_country("Sweden", path_uk); UK        <- load_country("UK",       path_uk)
+India   <- load_country("India",  path_ru); Indonesia <- load_country("Indonesia",path_ru)
+Serbia  <- load_country("Serbia", path_ru); Vietnam   <- load_country("Vietnam",  path_ru)
+cat("All countries loaded\n")
+```
+
+```{r group-averages}
+for (obj in c("Estonia","Poland","Sweden","UK","India","Indonesia","Serbia","Vietnam")) {
+  tmp <- get(obj); tmp$Time <- tmp$Time + 6; assign(obj, tmp)
+}
+pro_ukraine <- data.frame(
+  Time_aligned     = Estonia$Time,
+  gt_ukraine_group = rowMeans(cbind(Estonia$index,Poland$index,
+                                    Sweden$index,UK$index), na.rm=TRUE))
+pro_russia <- data.frame(
+  Time_aligned    = India$Time,
+  gt_russia_group = rowMeans(cbind(India$index,Indonesia$index,
+                                   Serbia$index,Vietnam$index), na.rm=TRUE))
+```
+
+```{r first-diff-groups, fig.height=6}
+d_gt_ukraine_group <- as.numeric(scale(diff(pro_ukraine$gt_ukraine_group)))
+d_gt_russia_group  <- as.numeric(scale(diff(pro_russia$gt_russia_group)))
+dates_ukraine_diff <- pro_ukraine$Time_aligned[-1]
+dates_russia_diff  <- pro_russia$Time_aligned[-1]
+
+cat("Pro-Ukraine — ADF p:", round(adf.test(d_gt_ukraine_group)$p.value,3),
+    "| KPSS p:", round(kpss.test(d_gt_ukraine_group)$p.value,3), "\n")
+cat("Pro-Russia  — ADF p:", round(adf.test(d_gt_russia_group)$p.value, 3),
+    "| KPSS p:", round(kpss.test(d_gt_russia_group)$p.value, 3), "\n")
+
+df_groups <- data.frame(
+  week  = c(dates_ukraine_diff, dates_russia_diff),
+  value = c(d_gt_ukraine_group, d_gt_russia_group),
+  group = rep(c("Pro-Ukraine countries","Pro-Russia countries"),
+              c(length(d_gt_ukraine_group), length(d_gt_russia_group)))
+)
+
+ggplot(df_groups, aes(x = week, y = value, color = group)) +
+  geom_line(linewidth = 1.0) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  scale_color_manual(values = c("Pro-Ukraine countries" = "#1A5276",
+                                "Pro-Russia countries"  = "#7B241C")) +
+  facet_wrap(~ group, ncol = 1) +
+  labs(title = "First-Differenced Google Search Interest by Country Group (Standardised)",
+       x = "Week", y = "SD units") +
+  theme_project() + theme(legend.position = "none")
+```
+
+```{r merge-groups}
+df_ukraine_group <- data.frame(week_date = dates_ukraine_diff,
+                               d_gt_ukraine_group = d_gt_ukraine_group)
+df_russia_group  <- data.frame(week_date = dates_russia_diff,
+                               d_gt_russia_group  = d_gt_russia_group)
+project_ext <- merge(project_data_2023on, df_ukraine_group, by = "week_date", all = FALSE)
+project_ext <- merge(project_ext,         df_russia_group,  by = "week_date", all = FALSE)
+cat("Rows after merge:", nrow(project_ext), "\n")
+```
+
+```{r build-lag-matrix-ext}
+n <- nrow(project_ext)
+project_ext$d_google_lag1     <- c(NA, project_ext$d_google[1:(n-1)])
+project_ext$d_google_lag2     <- c(NA,NA,project_ext$d_google[1:(n-2)])
+project_ext$d_gt_ukraine_lag1 <- c(NA, project_ext$d_gt_ukraine_group[1:(n-1)])
+project_ext$d_gt_ukraine_lag2 <- c(NA,NA,project_ext$d_gt_ukraine_group[1:(n-2)])
+project_ext$d_gt_russia_lag1  <- c(NA, project_ext$d_gt_russia_group[1:(n-1)])
+project_ext$d_gt_russia_lag2  <- c(NA,NA,project_ext$d_gt_russia_group[1:(n-2)])
+project_ext$d_ukraine_lag0    <- project_ext$d_ukraine
+project_ext$d_ukraine_lag1    <- c(NA, project_ext$d_ukraine[1:(n-1)])
+project_ext$d_ukraine_lag2    <- c(NA,NA,project_ext$d_ukraine[1:(n-2)])
+project_ext$d_russia_lag0     <- project_ext$d_russia
+project_ext$d_russia_lag1     <- c(NA, project_ext$d_russia[1:(n-1)])
+project_ext$d_russia_lag2     <- c(NA,NA,project_ext$d_russia[1:(n-2)])
+```
+
+```{r six-models}
+mA <- lm(d_google ~ d_google_lag1 + d_google_lag2 +
+           d_ukraine_lag0 + d_ukraine_lag1 + d_ukraine_lag2, data = project_ext)
+mB <- lm(d_google ~ d_google_lag1 + d_google_lag2 +
+           d_russia_lag0  + d_russia_lag1  + d_russia_lag2,  data = project_ext)
+mC <- lm(d_gt_ukraine_group ~ d_gt_ukraine_lag1 + d_gt_ukraine_lag2 +
+           d_ukraine_lag0 + d_ukraine_lag1 + d_ukraine_lag2, data = project_ext)
+mD <- lm(d_gt_ukraine_group ~ d_gt_ukraine_lag1 + d_gt_ukraine_lag2 +
+           d_russia_lag0  + d_russia_lag1  + d_russia_lag2,  data = project_ext)
+mE <- lm(d_gt_russia_group ~ d_gt_russia_lag1 + d_gt_russia_lag2 +
+           d_ukraine_lag0 + d_ukraine_lag1 + d_ukraine_lag2, data = project_ext)
+mF <- lm(d_gt_russia_group ~ d_gt_russia_lag1 + d_gt_russia_lag2 +
+           d_russia_lag0  + d_russia_lag1  + d_russia_lag2,  data = project_ext)
+
+models_6      <- list(mA, mB, mC, mD, mE, mF)
+model_names_6 <- c("A: World~UKR","B: World~RUS",
+                   "C: ProUKR~UKR","D: ProUKR~RUS",
+                   "E: ProRUS~UKR","F: ProRUS~RUS")
+print(data.frame(Model = model_names_6,
+                 R2 = round(sapply(models_6, function(m) summary(m)$r.squared), 4)))
+```
+
+```{r hac-six-models}
+hac_results_6 <- lapply(seq_along(models_6), function(i)
+  coeftest(models_6[[i]], vcov = NeweyWest(models_6[[i]], lag = 4)))
+for (i in seq_along(models_6)) {
+  cat("\n===", model_names_6[i], "(HAC) ===\n"); print(hac_results_6[[i]])
+}
+```
+
+```{r irfs-six, fig.height=5, fig.width=11}
+set.seed(42)
+horizon <- 6
+own_g <- c("d_google_lag1","d_google_lag2")
+own_u <- c("d_gt_ukraine_lag1","d_gt_ukraine_lag2")
+own_r <- c("d_gt_russia_lag1","d_gt_russia_lag2")
+cu    <- c("d_ukraine_lag0","d_ukraine_lag1","d_ukraine_lag2")
+cr    <- c("d_russia_lag0","d_russia_lag1","d_russia_lag2")
+
+ci_list <- list(
+  bootstrap_irf_ci(mA,own_g,cu,h=horizon,n_boot=500),
+  bootstrap_irf_ci(mB,own_g,cr,h=horizon,n_boot=500),
+  bootstrap_irf_ci(mC,own_u,cu,h=horizon,n_boot=500),
+  bootstrap_irf_ci(mD,own_u,cr,h=horizon,n_boot=500),
+  bootstrap_irf_ci(mE,own_r,cu,h=horizon,n_boot=500),
+  bootstrap_irf_ci(mF,own_r,cr,h=horizon,n_boot=500)
+)
+
+df_irf6 <- do.call(rbind, lapply(seq_along(ci_list), function(i) {
+  data.frame(
+    week      = 0:(horizon-1),
+    irf       = ci_list[[i]]$point,
+    lower     = ci_list[[i]]$lower,
+    upper     = ci_list[[i]]$upper,
+    territory = ifelse(i %% 2 == 1, "Ukraine","Russia"),
+    audience  = rep(c("Worldwide","Worldwide","Pro-Ukraine","Pro-Ukraine",
+                      "Pro-Russia","Pro-Russia"), each = horizon)[((i-1)*horizon+1):(i*horizon)]
+  )
+}))
+
+ggplot(df_irf6, aes(x = week, color = territory, fill = territory)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(aes(y = irf), linewidth = 1.3) +
+  geom_point(aes(y = irf), size = 2.2) +
+  scale_color_manual(values = c("Ukraine" = "#1A5276", "Russia" = "#C0392B"),
+                     name = "Conflict territory") +
+  scale_fill_manual(values  = c("Ukraine" = "#1A5276", "Russia" = "#C0392B"),
+                    name = "Conflict territory") +
+  facet_wrap(~ audience, ncol = 3) +
+  labs(title = "IRFs: Conflict Shock to Search Attention by Audience x Conflict Location",
+       subtitle = "Shaded band = 90% bootstrap CI | Location dominates audience",
+       x = "Weeks after shock", y = "SD units (search attention)") +
+  theme_project()
+
+cum <- round(sapply(ci_list, function(x) sum(x$point)), 4)
+cat("Cumulative IRF effects:\n")
+for (i in 1:6) cat(model_names_6[i], ":", cum[i], "\n")
+```
+
+> **Location dominates audience** in every group. Ukraine attacks insignificant everywhere.
+
+---
+
+# Extension 2 — Financial Markets and the VIX
+
+**Cholesky ordering:** d_conflict -> r_sp500 -> d_vix
+
+```{r vix-download}
+getSymbols("VIXCLS", src = "FRED")
+vix_raw      <- data.frame(date = index(VIXCLS), vix = as.numeric(VIXCLS))
+vix_raw      <- vix_raw[vix_raw$date >= as.Date("2023-01-01") & !is.na(vix_raw$vix), ]
+vix_raw$week <- as.Date(cut(vix_raw$date, breaks="week", start.on.monday=TRUE)) + 4
+vix_weekly   <- aggregate(vix ~ week, data=vix_raw, FUN=mean)
+colnames(vix_weekly) <- c("week_date","vix")
+vix_weekly   <- vix_weekly[order(vix_weekly$week_date),]
+vix_weekly$d_vix <- c(NA, diff(vix_weekly$vix))
+cat("Weekly VIX obs:", nrow(vix_weekly), "\n")
+```
+
+```{r sp500-download}
+sp500_xts <- getSymbols("^GSPC", src="yahoo",
+                        from="2023-01-01", to="2026-05-01", auto.assign=FALSE)
+sp500_raw      <- data.frame(date=index(sp500_xts), close=as.numeric(Cl(sp500_xts)))
+sp500_raw      <- sp500_raw[!is.na(sp500_raw$close),]
+sp500_raw$week <- as.Date(cut(sp500_raw$date, breaks="week", start.on.monday=TRUE)) + 4
+sp500_weekly   <- aggregate(close ~ week, data=sp500_raw, FUN=tail, n=1)
+colnames(sp500_weekly) <- c("week_date","sp500")
+sp500_weekly$sp500   <- as.numeric(sp500_weekly$sp500)
+sp500_weekly         <- sp500_weekly[order(sp500_weekly$week_date),]
+sp500_weekly$r_sp500 <- c(NA, diff(log(sp500_weekly$sp500))*100)
+cat("Weekly S&P 500 obs:", nrow(sp500_weekly), "\n")
+```
+
+```{r vix-stationarity}
+d_vix_clean   <- na.omit(vix_weekly$d_vix)
+r_sp500_clean <- na.omit(sp500_weekly$r_sp500)
+cat("VIX levels    — ADF p:", round(adf.test(vix_weekly$vix)$p.value,3),
+    "| KPSS p:", round(kpss.test(vix_weekly$vix)$p.value,3), "\n")
+cat("VIX diff      — ADF p:", round(adf.test(d_vix_clean)$p.value,3),
+    "| KPSS p:", round(kpss.test(d_vix_clean)$p.value,3), "\n")
+cat("SP500 returns — ADF p:", round(adf.test(r_sp500_clean)$p.value,3),
+    "| KPSS p:", round(kpss.test(r_sp500_clean)$p.value,3), "\n")
+```
+
+```{r plot-vix-sp500, fig.height=4, fig.width=8}
+par(mfrow = c(1,2), mar = c(4, 4.5, 3.5, 1), bg = "white")
+
+plot(vix_weekly$week_date[-1], d_vix_clean,
+     type = "l", col = "#7B2D8B", lwd = 1.5,
+     main = "VIX — First Difference",
+     xlab = "Week", ylab = "Change in VIX",
+     cex.main = 1.2, cex.lab = 1.1, cex.axis = 1.0)
+abline(h = 0, col = "#C0392B", lty = 2, lwd = 1.2)
+
+plot(sp500_weekly$week_date[-1], r_sp500_clean,
+     type = "l", col = "#1E6B2E", lwd = 1.5,
+     main = "S&P 500 — Weekly Returns",
+     xlab = "Week", ylab = "Return (%)",
+     cex.main = 1.2, cex.lab = 1.1, cex.axis = 1.0)
+abline(h = 0, col = "#C0392B", lty = 2, lwd = 1.2)
+
+par(mfrow = c(1,1))
+```
+
+```{r merge-vix}
+df_vix   <- data.frame(week_date=vix_weekly$week_date+1,   d_vix=vix_weekly$d_vix)
+df_vix   <- df_vix[!is.na(df_vix$d_vix),]
+df_sp500 <- data.frame(week_date=sp500_weekly$week_date+1, r_sp500=sp500_weekly$r_sp500)
+df_sp500 <- df_sp500[!is.na(df_sp500$r_sp500),]
+project_vix_sp <- merge(project_data_2023on, df_vix,   by="week_date", all=FALSE)
+project_vix_sp <- merge(project_vix_sp,      df_sp500, by="week_date", all=FALSE)
+cat("Rows after merge:", nrow(project_vix_sp), "\n")
+```
+
+```{r var-vix}
+var2_data <- na.omit(project_vix_sp[, c("d_ukraine","d_russia","r_sp500","d_vix")])
+lag2      <- VARselect(var2_data, lag.max=6, type="const")
+p2        <- which.min(lag2$criteria["SC(n)",])
+cat("BIC selects p =", p2, "\n")
+est.VAR2  <- VAR(var2_data, p=p2, type="const")
+Phi2 <- Acoef(est.VAR2); PHI2 <- make.PHI(Phi2)
+cat("Eigenvalues:", round(abs(eigen(PHI2)$values),4), "\n")
+```
+
+```{r granger-vix}
+cat("H0: d_ukraine does NOT Granger-cause r_sp500 + d_vix\n")
+print(causality(est.VAR2, cause="d_ukraine")$Granger)
+cat("H0: d_russia does NOT Granger-cause r_sp500 + d_vix\n")
+print(causality(est.VAR2, cause="d_russia")$Granger)
+cat("H0: d_vix does NOT Granger-cause conflict\n")
+print(causality(est.VAR2, cause="d_vix")$Granger)
+
+var_ukr_ctrl <- VAR(na.omit(project_vix_sp[,c("d_ukraine","r_sp500","d_vix")]),
+                    p=1, type="const")
+var_rus_ctrl <- VAR(na.omit(project_vix_sp[,c("d_russia","r_sp500","d_vix")]),
+                    p=1, type="const")
+cat("\nIndividual: d_ukraine -> d_vix (controlling S&P500)\n")
+print(causality(var_ukr_ctrl, cause="d_ukraine")$Granger)
+cat("\nIndividual: d_russia -> d_vix (controlling S&P500)\n")
+print(causality(var_rus_ctrl, cause="d_russia")$Granger)
+```
+
+## VIX IRFs with Bootstrap Confidence Bands
+
+The `vars` package computes bootstrap CIs natively via its `irf()` function.
+Shaded bands = 95% bootstrap CI (500 replications).
+
+```{r irfs-vix, fig.height=6, fig.width=11}
+set.seed(42)
+
+# Bootstrap IRFs from the vars package (built-in, 95% CI)
+irf_ukr_vix <- irf(est.VAR2, impulse = "d_ukraine", response = "d_vix",
+                   n.ahead = 19, boot = TRUE, ci = 0.95, runs = 500)
+irf_rus_vix <- irf(est.VAR2, impulse = "d_russia",  response = "d_vix",
+                   n.ahead = 19, boot = TRUE, ci = 0.95, runs = 500)
+
+weeks <- 0:19
+
+df_vix_irf <- data.frame(
+  week      = rep(weeks, 2),
+  irf       = c(as.numeric(irf_ukr_vix$irf$d_ukraine),
+                as.numeric(irf_rus_vix$irf$d_russia)),
+  lower     = c(as.numeric(irf_ukr_vix$Lower$d_ukraine),
+                as.numeric(irf_rus_vix$Lower$d_russia)),
+  upper     = c(as.numeric(irf_ukr_vix$Upper$d_ukraine),
+                as.numeric(irf_rus_vix$Upper$d_russia)),
+  territory = rep(c("Ukraine territory","Russia territory"), each = 20)
+)
+
+ggplot(df_vix_irf, aes(x = week, color = territory, fill = territory)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(aes(y = irf), linewidth = 1.4) +
+  geom_point(aes(y = irf), size = 2.5) +
+  scale_color_manual(values = c("Ukraine territory" = "#1E8449",
+                                "Russia territory"  = "#C0392B")) +
+  scale_fill_manual(values  = c("Ukraine territory" = "#1E8449",
+                                "Russia territory"  = "#C0392B")) +
+  labs(title = "Conflict Shock to VIX (Controlling for S&P 500)",
+       subtitle = "Shaded band = 95% bootstrap CI (vars package, 500 reps)",
+       x = "Weeks after shock", y = "Change in VIX") +
+  theme_project()
+
+cat("Cumulative VIX — Ukraine:", round(sum(irf_ukr_vix$irf$d_ukraine), 4), "\n")
+cat("Cumulative VIX — Russia: ", round(sum(irf_rus_vix$irf$d_russia),  4), "\n")
+```
+
+> **Conclusion:** Normalisation holds in financial markets. Russia attacks Granger-cause
+> VIX (p approx 0.016); Ukraine attacks do not (p approx 0.698). No reverse causality.
+
+---
+
+*End of project script.*
